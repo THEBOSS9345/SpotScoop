@@ -3,6 +3,7 @@ package ytdl
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
@@ -25,8 +26,16 @@ import (
 
 var cdnHTTPClient = &http.Client{Timeout: 60 * time.Second}
 
+// errCDNForbidden signals that the extracted CDN URL is not usable by this
+// client, so the caller should fall back to yt-dlp's own downloader.
+var errCDNForbidden = errors.New("CDN returned 403 Forbidden")
+
 // doWithRetry retries transient/rate-limit failures against the YouTube CDN
 // with exponential backoff, honoring Retry-After when the CDN sends one.
+//
+// 403 is deliberately not retried: the CDN binds the extracted URL to the
+// session yt-dlp used to sign it, so a 403 is a permanent rejection of this
+// client rather than throttling, and retrying only delays the fallback.
 func doWithRetry(req *http.Request, maxAttempts int) (*http.Response, error) {
 	var lastErr error
 	for attempt := 0; attempt < maxAttempts; attempt++ {
@@ -45,7 +54,12 @@ func doWithRetry(req *http.Request, maxAttempts int) (*http.Response, error) {
 			continue
 		}
 
-		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusForbidden || resp.StatusCode >= 500 {
+		if resp.StatusCode == http.StatusForbidden {
+			resp.Body.Close()
+			return nil, errCDNForbidden
+		}
+
+		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
 			lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
 			if retryAfter := parseRetryAfter(resp.Header.Get("Retry-After")); retryAfter > 0 {
 				resp.Body.Close()
@@ -378,6 +392,49 @@ func (s *Service) downloadChunk(ctx context.Context, url string, f *os.File, sta
 }
 
 func (s *Service) downloadWithYtDlp(ctx context.Context, result SearchResult, filename string, onProgress func(domain.DownloadProgress)) error {
+	err := s.downloadViaCDN(ctx, result, filename, onProgress)
+	if errors.Is(err, errCDNForbidden) {
+		logs.Warning("CDN rejected direct download for %s, falling back to yt-dlp", result.Title)
+		return s.downloadNative(ctx, result, filename, onProgress)
+	}
+	return err
+}
+
+// downloadNative lets yt-dlp fetch the audio itself. It is slower than the
+// concurrent CDN path but survives the cases where the CDN refuses a URL
+// fetched outside yt-dlp's own session.
+func (s *Service) downloadNative(ctx context.Context, result SearchResult, filename string, onProgress func(domain.DownloadProgress)) error {
+	dl := s.dl.Clone().
+		ExtractAudio().
+		AudioFormat("m4a").
+		AudioQuality("0").
+		AgeLimit(99).
+		Output(filepath.Join(s.outputDir, filename+".%(ext)s")).
+		ProgressFunc(time.Second, func(update ytdlp.ProgressUpdate) {
+			pct := int(update.Percent())
+			onProgress(domain.DownloadProgress{
+				Status:          domain.DownloadDownloading,
+				Progress:        25 + pct/5,
+				DownloadedBytes: int64(update.DownloadedBytes),
+				TotalBytes:      int64(update.TotalBytes),
+			})
+		})
+
+	if _, err := dl.Run(ctx, result.URL); err != nil {
+		return fmt.Errorf("yt-dlp native download failed: %w", err)
+	}
+
+	outputPath := filepath.Join(s.outputDir, filename+".m4a")
+	if _, err := os.Stat(outputPath); err != nil {
+		return fmt.Errorf("yt-dlp reported success but %s is missing: %w", outputPath, err)
+	}
+
+	onProgress(domain.DownloadProgress{Status: domain.DownloadDownloading, Progress: 45})
+	logs.Debug("Downloaded via yt-dlp to %s", outputPath)
+	return nil
+}
+
+func (s *Service) downloadViaCDN(ctx context.Context, result SearchResult, filename string, onProgress func(domain.DownloadProgress)) error {
 	outputPath := filepath.Join(s.outputDir, filename+".m4a")
 
 	dl := s.dl.Clone().
@@ -424,6 +481,7 @@ func (s *Service) downloadWithYtDlp(ctx context.Context, result SearchResult, fi
 		err = s.downloadRange(ctx, mediaURL, out, fileSize, onProgress)
 		if err != nil {
 			out.Close()
+			os.Remove(outputPath)
 			return err
 		}
 		out.Close()
@@ -495,6 +553,10 @@ func (s *Service) downloadWithYtDlp(ctx context.Context, result SearchResult, fi
 
 	for err := range errCh {
 		if err != nil {
+			os.Remove(outputPath)
+			if errors.Is(err, errCDNForbidden) {
+				return err
+			}
 			return fmt.Errorf("concurrent download: %w", err)
 		}
 	}
