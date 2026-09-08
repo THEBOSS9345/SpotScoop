@@ -80,9 +80,14 @@ func apiParseRetryAfter(v string) time.Duration {
 }
 
 type Service struct {
+	// clientMu guards client/httpClient: they are swapped by SetClient from the
+	// OAuth callback, the startup token loader and logout, while HTTP handlers
+	// read them concurrently.
+	clientMu   sync.RWMutex
 	client     *spotify.Client
 	httpClient *http.Client
-	db         *db.DB
+
+	db *db.DB
 
 	anon   *anonClient
 	anonMu sync.Mutex
@@ -97,16 +102,29 @@ func (s *Service) SetDB(database *db.DB) {
 }
 
 func (s *Service) SetClient(client *spotify.Client, httpClient *http.Client) {
+	s.clientMu.Lock()
 	s.client = client
 	s.httpClient = httpClient
+	s.clientMu.Unlock()
+}
+
+// clients returns a consistent snapshot of both clients. Callers must use the
+// returned values rather than re-reading the fields, so a concurrent logout
+// cannot swap them mid-request.
+func (s *Service) clients() (*spotify.Client, *http.Client) {
+	s.clientMu.RLock()
+	defer s.clientMu.RUnlock()
+	return s.client, s.httpClient
 }
 
 func (s *Service) IsReady() bool {
+	s.clientMu.RLock()
+	defer s.clientMu.RUnlock()
 	return s.client != nil
 }
 
 func (s *Service) GetPlaylists(ctx context.Context) ([]domain.Playlist, error) {
-	if s.client == nil {
+	if client, _ := s.clients(); client == nil {
 		return nil, fmt.Errorf("spotify client not initialized")
 	}
 
@@ -124,7 +142,7 @@ func (s *Service) GetPlaylists(ctx context.Context) ([]domain.Playlist, error) {
 }
 
 func (s *Service) RefreshPlaylists(ctx context.Context) ([]domain.Playlist, error) {
-	if s.client == nil {
+	if client, _ := s.clients(); client == nil {
 		return nil, fmt.Errorf("spotify client not initialized")
 	}
 	return s.fetchPlaylists(ctx)
@@ -140,14 +158,19 @@ func (s *Service) refreshPlaylists() {
 }
 
 func (s *Service) fetchPlaylists(ctx context.Context) ([]domain.Playlist, error) {
-	playlists, err := s.client.CurrentUsersPlaylists(ctx, spotify.Limit(50))
+	client, _ := s.clients()
+	if client == nil {
+		return nil, fmt.Errorf("spotify client not initialized")
+	}
+
+	playlists, err := client.CurrentUsersPlaylists(ctx, spotify.Limit(50))
 	if err != nil {
 		logs.Error("Failed to fetch playlists: %v", err)
 		return nil, err
 	}
 
 	result := make([]domain.Playlist, 0, len(playlists.Playlists))
-	currentUser, err := s.client.CurrentUser(ctx)
+	currentUser, err := client.CurrentUser(ctx)
 	if err != nil {
 		logs.Error("Failed to get current user: %v", err)
 		return nil, err
@@ -287,10 +310,10 @@ func ParsePlaylistID(input string) string {
 }
 
 func (s *Service) GetPlaylistByID(ctx context.Context, playlistID string) (*domain.Playlist, error) {
-	if s.httpClient != nil {
+	if _, httpClient := s.clients(); httpClient != nil {
 		url := fmt.Sprintf("https://api.spotify.com/v1/playlists/%s", playlistID)
 		req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
-		resp, err := s.httpClient.Do(req)
+		resp, err := httpClient.Do(req)
 		if err == nil {
 			defer resp.Body.Close()
 			if resp.StatusCode == http.StatusOK {
@@ -316,13 +339,14 @@ func (s *Service) GetPlaylistByID(ctx context.Context, playlistID string) (*doma
 }
 
 func (s *Service) SearchTracks(ctx context.Context, query string) ([]domain.Song, error) {
-	if s.httpClient == nil {
+	_, httpClient := s.clients()
+	if httpClient == nil {
 		return nil, fmt.Errorf("spotify client not initialized")
 	}
 
 	url := fmt.Sprintf("https://api.spotify.com/v1/search?q=%s&type=track&limit=10", url.QueryEscape(query))
 	req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
-	resp, err := s.httpClient.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("search request failed: %v", err)
 	}
@@ -374,7 +398,7 @@ func (s *Service) SearchTracks(ctx context.Context, query string) ([]domain.Song
 }
 
 func (s *Service) GetPlaylistTracks(ctx context.Context, playlistID string) ([]domain.Song, error) {
-	if s.client == nil {
+	if client, _ := s.clients(); client == nil {
 		return nil, fmt.Errorf("spotify client not initialized")
 	}
 
@@ -392,7 +416,7 @@ func (s *Service) GetPlaylistTracks(ctx context.Context, playlistID string) ([]d
 }
 
 func (s *Service) RefreshPlaylistTracks(ctx context.Context, playlistID string) ([]domain.Song, error) {
-	if s.client == nil {
+	if client, _ := s.clients(); client == nil {
 		return nil, fmt.Errorf("spotify client not initialized")
 	}
 	return s.fetchTracks(ctx, playlistID)
@@ -411,11 +435,12 @@ func (s *Service) fetchTracks(ctx context.Context, playlistID string) ([]domain.
 	var result []domain.Song
 	var err error
 
-	if s.httpClient != nil {
-		result, err = s.fetchTracksOAuth(ctx, playlistID)
+	_, httpClient := s.clients()
+	if httpClient != nil {
+		result, err = s.fetchTracksOAuth(ctx, httpClient, playlistID)
 	}
 
-	if err != nil || s.httpClient == nil {
+	if err != nil || httpClient == nil {
 		result, err = s.fetchTracksAnon(ctx, playlistID)
 	}
 
@@ -428,13 +453,13 @@ func (s *Service) fetchTracks(ctx context.Context, playlistID string) ([]domain.
 	return result, err
 }
 
-func (s *Service) fetchTracksOAuth(ctx context.Context, playlistID string) ([]domain.Song, error) {
+func (s *Service) fetchTracksOAuth(ctx context.Context, httpClient *http.Client, playlistID string) ([]domain.Song, error) {
 	url := fmt.Sprintf("https://api.spotify.com/v1/playlists/%s/items?limit=50", playlistID)
 
 	var result []domain.Song
 	for {
 		req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
-		resp, err := s.httpClient.Do(req)
+		resp, err := httpClient.Do(req)
 		if err != nil {
 			return nil, fmt.Errorf("request failed: %v", err)
 		}

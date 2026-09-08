@@ -12,7 +12,13 @@ import (
 	"github.com/lrstanley/go-ytdlp"
 )
 
+// TestDirectDownload is a scratch diagnostic that prints environment details
+// and asserts nothing. It hits the network, so it is opt-in; see
+// TestDownloadEndToEnd for the actual download regression test.
 func TestDirectDownload(t *testing.T) {
+	if os.Getenv("SPOTSCOOP_E2E") != "1" {
+		t.Skip("set SPOTSCOOP_E2E=1 to run the yt-dlp diagnostic")
+	}
 	os.Setenv("YTDLP_DEBUG", "true")
 
 	url := "https://www.youtube.com/watch?v=XoiOOiuH8iI"

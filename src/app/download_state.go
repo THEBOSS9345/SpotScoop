@@ -3,6 +3,7 @@ package app
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
 
 	"spotscoop/src/domain"
 )
@@ -24,15 +25,13 @@ var statusOrder = map[domain.DownloadStatus]int{
 }
 
 func sortDownloads(dl []domain.Download) {
-	for i := 0; i < len(dl); i++ {
-		for j := i + 1; j < len(dl); j++ {
-			si := statusOrder[dl[i].Status]
-			sj := statusOrder[dl[j].Status]
-			if si > sj || (si == sj && dl[i].CreatedAt > dl[j].CreatedAt) {
-				dl[i], dl[j] = dl[j], dl[i]
-			}
+	sort.SliceStable(dl, func(i, j int) bool {
+		si, sj := statusOrder[dl[i].Status], statusOrder[dl[j].Status]
+		if si != sj {
+			return si < sj
 		}
-	}
+		return dl[i].CreatedAt < dl[j].CreatedAt
+	})
 }
 
 func downloadToMap(d domain.Download) map[string]interface{} {

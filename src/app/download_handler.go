@@ -38,10 +38,17 @@ func (h *Handler) handleDownload(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleDownloads(w http.ResponseWriter, r *http.Request) {
+	if !h.requireAuth(w, r) {
+		return
+	}
 	h.json(w, h.buildDownloadState())
 }
 
 func (h *Handler) handleEvents(w http.ResponseWriter, r *http.Request) {
+	if !h.requireAuth(w, r) {
+		return
+	}
+
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "streaming not supported", http.StatusInternalServerError)

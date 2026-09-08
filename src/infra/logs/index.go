@@ -2,6 +2,7 @@ package logs
 
 import (
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -17,8 +18,13 @@ type Entry struct {
 
 var (
 	debugMode atomic.Bool
-	logCh    chan Entry
-	tuiMode  atomic.Bool
+	tuiMode   atomic.Bool
+
+	// logMu guards logCh. Shutdown clears it and then closes the channel while
+	// worker goroutines are still logging; holding the read lock across the
+	// send keeps a sender from writing to an already-closed channel.
+	logMu sync.RWMutex
+	logCh chan Entry
 
 	callerStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#5C6370"))
@@ -40,7 +46,9 @@ var (
 )
 
 func SetLogChannel(ch chan Entry) {
+	logMu.Lock()
 	logCh = ch
+	logMu.Unlock()
 }
 
 func SetTUIMode(enabled bool) {
@@ -61,9 +69,20 @@ func IsDebug() bool {
 
 func send(level string, msgStyle lipgloss.Style, caller, msg string) {
 	entry := Entry{Time: time.Now(), Level: level, Caller: caller, Message: msg}
-	if logCh != nil {
-		logCh <- entry
-	} else if !tuiMode.Load() {
+
+	logMu.RLock()
+	ch := logCh
+	if ch != nil {
+		// Non-blocking: a stalled or full TUI consumer must not wedge every
+		// goroutine that logs.
+		select {
+		case ch <- entry:
+		default:
+		}
+	}
+	logMu.RUnlock()
+
+	if ch == nil && !tuiMode.Load() {
 		fmt.Printf("%s %s %s\n",
 			entry.Time.Format("3:04PM"),
 			callerStyle.Render(caller),

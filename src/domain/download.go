@@ -13,6 +13,7 @@ const (
 
 type Download struct {
 	ID              string         `json:"id"`
+	BatchID         string         `json:"batchId,omitempty"`
 	Song            Song           `json:"song"`
 	Status          DownloadStatus `json:"status"`
 	Progress        int            `json:"progress"`

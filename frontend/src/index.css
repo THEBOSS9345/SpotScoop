@@ -13,6 +13,9 @@
   --accent-hover: #1ed760;
   --accent-dim: #169c46;
   --error: #e91429;
+  --error-bg: rgba(233,20,41,0.08);
+  --error-border: rgba(233,20,41,0.22);
+  --converting: #e5a00d;
   --border: #222;
   --radius-sm: 6px;
   --radius: 8px;

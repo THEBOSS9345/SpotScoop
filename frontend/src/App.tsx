@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { BrowserRouter, Routes, Route, useNavigate } from 'react-router-dom'
 import { api } from './api'
+import { setStreamEnabled } from './useDownloadState'
 import { Login } from './pages/Login'
 import { Playlists } from './pages/Playlists'
 import { PlaylistDetail } from './pages/PlaylistDetail'
@@ -26,6 +27,11 @@ function AppRoutes() {
       setLoading(false)
     }).catch(() => setLoading(false))
   }, [])
+
+  // The event stream needs auth; connecting while logged out only loops on 401.
+  useEffect(() => {
+    setStreamEnabled(authed)
+  }, [authed])
 
   const handleLogin = async () => {
     try {

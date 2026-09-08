@@ -35,6 +35,13 @@ export function Downloads() {
     } catch { toast('Retry failed', 'error') }
   }, [])
 
+  const handleRetryAll = useCallback(async (ids: string[]) => {
+    try {
+      await api.retry(ids)
+      toast(`Retrying ${ids.length} download${ids.length > 1 ? 's' : ''}`, 'success')
+    } catch { toast('Retry failed', 'error') }
+  }, [])
+
   const completed = downloads.filter(d => d.status === 'complete')
   const failed = downloads.filter(d => d.status === 'failed')
   const activeItems = downloads.filter(d => ['searching', 'downloading', 'converting'].includes(d.status))
@@ -66,6 +73,16 @@ export function Downloads() {
           }}>
             {active + queued} in progress
           </span>
+        )}
+
+        {failed.length > 0 && (
+          <button
+            onClick={() => handleRetryAll(failed.map(d => d.id))}
+            className="pill pill-outline"
+            style={{ fontSize: 11, padding: '5px 14px', marginLeft: 'auto' }}
+          >
+            Retry all failed ({failed.length})
+          </button>
         )}
       </div>
 
@@ -156,19 +173,32 @@ function formatBytes(bytes: number): string {
   return mb >= 1 ? `${mb.toFixed(1)} MB` : `${(bytes / 1024).toFixed(0)} KB`
 }
 
+// Backend errors arrive as wrapped Go chains ("download failed: chunk request:
+// unexpected status: 403 Forbidden"). The last segment is the actionable part,
+// so lead with it while keeping the full text available on hover.
+function shortError(err: string): string {
+  const parts = err.split(':').map(s => s.trim()).filter(Boolean)
+  const tail = parts.length > 1 ? parts[parts.length - 1] : err
+  return tail.length > 3 ? tail : err
+}
+
 function DownloadRow({ d, dimmed, onRetry, delay }: { d: Download; dimmed?: boolean; onRetry?: (d: Download) => void; delay?: number }) {
   const active = ['pending', 'searching', 'downloading', 'converting'].includes(d.status)
+  const failed = d.status === 'failed'
   const hasBytes = d.downloadedBytes > 0 && d.totalBytes > 0
   const pct = hasBytes ? Math.round(d.downloadedBytes / d.totalBytes * 100) : d.progress
+  const barColor = d.status === 'converting' ? 'var(--converting)' : 'var(--accent)'
+
   return (
-    <div onClick={() => d.status === 'failed' && onRetry?.(d)} className="slide-up" style={{
+    <div className="slide-up" style={{
       display: 'flex', alignItems: 'center', gap: 12,
-      padding: '10px 14px', background: dimmed ? 'var(--bg)' : 'var(--bg-surface)',
-      borderRadius: 'var(--radius)', cursor: d.status === 'failed' ? 'pointer' : undefined,
+      padding: '10px 14px',
+      background: failed ? 'var(--error-bg)' : dimmed ? 'var(--bg)' : 'var(--bg-surface)',
+      borderRadius: 'var(--radius)',
       transition: 'background var(--transition), opacity var(--transition)',
-      opacity: active ? 1 : 0.65,
+      opacity: active || failed ? 1 : 0.65,
       animationDelay: `${delay || 0}ms`,
-      border: d.status === 'failed' ? '1px solid rgba(233,20,41,0.15)' : '1px solid transparent',
+      border: failed ? '1px solid var(--error-border)' : '1px solid transparent',
     }}>
       <span style={{
         width: 24, height: 24, borderRadius: 4, background: 'var(--bg-hover)',
@@ -182,34 +212,51 @@ function DownloadRow({ d, dimmed, onRetry, delay }: { d: Download; dimmed?: bool
         <div style={{
           fontWeight: 500, fontSize: 13, marginBottom: 1,
           whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
-          color: d.status === 'failed' ? 'var(--error)' : 'var(--text)',
+          color: failed ? 'var(--error)' : 'var(--text)',
           transition: 'color var(--transition)',
         }}>
           {d.song?.title || ''}
         </div>
         <div style={{ fontSize: 11, color: 'var(--text-subdued)' }}>{d.song?.artist || ''}</div>
+
+        {failed && d.error && (
+          <div title={d.error} style={{
+            fontSize: 11, color: 'var(--error)', opacity: 0.85, marginTop: 4,
+            whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
+          }}>
+            {shortError(d.error)}
+          </div>
+        )}
       </div>
 
       {(active && d.status !== 'pending') ? (
-        <div style={{ width: 140, display: 'flex', flexDirection: 'column', gap: 3 }}>
+        <div style={{ width: 140, display: 'flex', flexDirection: 'column', gap: 3, flexShrink: 0 }}>
           <div style={{ height: 6, background: 'var(--bg-hover)', borderRadius: 3, overflow: 'hidden' }}>
             <div style={{
               height: '100%', width: `${Math.max(pct, 2)}%`,
-              background: d.status === 'converting' ? 'var(--accent)' : 'var(--accent)',
+              background: barColor,
               borderRadius: 3,
-              transition: 'width 0.3s cubic-bezier(0.4, 0, 0.2, 1)',
+              transition: 'width 0.3s cubic-bezier(0.4, 0, 0.2, 1), background var(--transition)',
             }} />
           </div>
           <div style={{ fontSize: 10, color: 'var(--text-subdued)', textAlign: 'right' }}>
             {d.status === 'downloading' && hasBytes
               ? `${formatBytes(d.downloadedBytes)} / ${formatBytes(d.totalBytes)}`
-              : `${pct}%`}
+              : d.status === 'converting' ? 'Converting' : `${pct}%`}
           </div>
         </div>
+      ) : failed && onRetry ? (
+        <button
+          onClick={() => onRetry(d)}
+          className="pill pill-outline"
+          style={{ fontSize: 11, padding: '5px 14px', flexShrink: 0 }}
+        >
+          Retry
+        </button>
       ) : (
         <div style={{
           fontSize: 11, fontWeight: 600, textAlign: 'right', minWidth: 64,
-          color: d.status === 'failed' ? 'var(--error)' : d.status === 'complete' ? 'var(--accent)' : 'var(--text-secondary)',
+          color: d.status === 'complete' ? 'var(--accent)' : 'var(--text-secondary)',
           transition: 'color var(--transition)',
         }}>
           {label[d.status] || d.status}

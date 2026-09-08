@@ -3,6 +3,7 @@ package app
 import (
 	"encoding/json"
 	"net/http"
+	"sync"
 
 	"spotscoop/src/auth"
 	"spotscoop/src/domain"
@@ -13,9 +14,14 @@ import (
 )
 
 type Handler struct {
-	auth       *auth.SpotifyAuthServer
-	spotify    *spotify.Service
-	user       *domain.User
+	auth    *auth.SpotifyAuthServer
+	spotify *spotify.Service
+
+	// userMu guards user: it is written by the OAuth callback, the startup
+	// token loader and logout, while request handlers read it concurrently.
+	userMu sync.RWMutex
+	user   *domain.User
+
 	downloader *Downloader
 	broker     *Broker
 }
@@ -31,9 +37,28 @@ func NewHandler(auth *auth.SpotifyAuthServer, spotify *spotify.Service, ytdl *yt
 	}
 }
 
-func (h *Handler) CleanupStale()             { h.downloader.CleanupStale() }
-func (h *Handler) Shutdown()                 { h.downloader.Clear(); h.downloader.CleanupStale() }
-func (h *Handler) SetUser(user *domain.User) { h.user = user }
+func (h *Handler) CleanupStale() { h.downloader.CleanupStale() }
+
+func (h *Handler) Shutdown() {
+	h.downloader.Clear()
+	h.downloader.Close()
+	h.downloader.CleanupStale()
+}
+
+func (h *Handler) SetUser(user *domain.User) {
+	h.userMu.Lock()
+	h.user = user
+	h.userMu.Unlock()
+}
+
+// currentUser returns a snapshot of the signed-in user. Handlers must use the
+// returned value rather than reading h.user again, so a concurrent logout
+// cannot null it out mid-request.
+func (h *Handler) currentUser() *domain.User {
+	h.userMu.RLock()
+	defer h.userMu.RUnlock()
+	return h.user
+}
 
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/status", h.handleStatus)

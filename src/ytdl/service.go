@@ -122,6 +122,25 @@ type Service struct {
 	ytCfg              config.YoutubeConfig
 }
 
+// resolvePlayerClient returns the InnerTube client to extract with, falling
+// back to the token-free default when the config leaves it unset.
+func resolvePlayerClient(ytCfg config.YoutubeConfig) string {
+	if ytCfg.PlayerClient != "" {
+		return ytCfg.PlayerClient
+	}
+	return config.DefaultPlayerClient
+}
+
+// buildExtractorArgs assembles the youtube extractor args. Multiple args for a
+// single extractor share one value, separated by ";".
+func buildExtractorArgs(ytCfg config.YoutubeConfig) string {
+	args := "youtube:player_client=" + resolvePlayerClient(ytCfg)
+	if ytCfg.PoToken != "" {
+		args += ";po_token=" + ytCfg.PoToken
+	}
+	return args
+}
+
 func New(outputDir string, maxDownloadThreads int, ytCfg config.YoutubeConfig) *Service {
 	logs.Info("Checking and preparing media environments...")
 
@@ -132,13 +151,19 @@ func New(outputDir string, maxDownloadThreads int, ytCfg config.YoutubeConfig) *
 
 	logs.Info("Environment successfully validated! Ready to download videos.")
 
+	playerClient := resolvePlayerClient(ytCfg)
+	extractorArgs := buildExtractorArgs(ytCfg)
+
 	dl := ytdlp.New().
 		NoPlaylist().
 		NoWarnings().
 		JsRuntimes("bun:" + installPaths.Bun).
 		SleepRequests(1).
 		Retries("10").
-		ExtractorRetries("5")
+		ExtractorRetries("5").
+		ExtractorArgs(extractorArgs)
+
+	logs.Info("Using YouTube player client: %s (PO token: %v)", playerClient, ytCfg.PoToken != "")
 
 	if ytCfg.Cookies != "" {
 		if _, err := os.Stat(ytCfg.Cookies); err == nil {
@@ -270,7 +295,9 @@ func (s *Service) Download(
 
 	hasThumb := s.fetchThumbnail(result, filename, song.AlbumArt)
 
-	onProgress(domain.DownloadProgress{Status: domain.DownloadDownloading, Progress: 70})
+	// ffmpeg transcode is the slowest non-network step; report it as its own
+	// phase so the UI does not sit frozen at "downloading 70%" throughout.
+	onProgress(domain.DownloadProgress{Status: domain.DownloadConverting, Progress: 70})
 
 	m4aPath := filepath.Join(s.outputDir, filename+".m4a")
 	mp3Path := filepath.Join(s.outputDir, filename+".mp3")
@@ -392,6 +419,14 @@ func (s *Service) downloadChunk(ctx context.Context, url string, f *os.File, sta
 }
 
 func (s *Service) downloadWithYtDlp(ctx context.Context, result SearchResult, filename string, onProgress func(domain.DownloadProgress)) error {
+	// yt-dlp's own downloader is the primary path. The concurrent CDN
+	// downloader is faster but only usable if YouTube serves the media URL to a
+	// client other than the one that signed it, which PO Token enforcement now
+	// prevents, so it is opt-in and still falls back on rejection.
+	if !s.ytCfg.DirectDownload {
+		return s.downloadNative(ctx, result, filename, onProgress)
+	}
+
 	err := s.downloadViaCDN(ctx, result, filename, onProgress)
 	if errors.Is(err, errCDNForbidden) {
 		logs.Warning("CDN rejected direct download for %s, falling back to yt-dlp", result.Title)
@@ -493,10 +528,17 @@ func (s *Service) downloadViaCDN(ctx context.Context, result SearchResult, filen
 
 	chunkSize := fileSize / int64(s.maxDownloadThreads)
 	var downloaded atomic.Int64
-	progCancel := make(chan struct{})
-	defer close(progCancel)
+
+	// The reporter must not emit anything once the outcome is known: a late
+	// callback would overwrite a failed status back to "downloading" and strand
+	// the task there. It therefore stops silently, the caller waits for it to
+	// exit before inspecting errors, and the terminal update is sent only on
+	// the success path below.
+	progStop := make(chan struct{})
+	progDone := make(chan struct{})
 
 	go func() {
+		defer close(progDone)
 		ticker := time.NewTicker(200 * time.Millisecond)
 		defer ticker.Stop()
 		for {
@@ -510,13 +552,7 @@ func (s *Service) downloadViaCDN(ctx context.Context, result SearchResult, filen
 					DownloadedBytes: d,
 					TotalBytes:      fileSize,
 				})
-			case <-progCancel:
-				onProgress(domain.DownloadProgress{
-					Status:          domain.DownloadDownloading,
-					Progress:        45,
-					DownloadedBytes: fileSize,
-					TotalBytes:      fileSize,
-				})
+			case <-progStop:
 				return
 			}
 		}
@@ -551,6 +587,11 @@ func (s *Service) downloadViaCDN(ctx context.Context, result SearchResult, filen
 	close(errCh)
 	out.Close()
 
+	// Stop the reporter and wait for it before deciding the outcome, so no
+	// progress update can land after a failure is recorded.
+	close(progStop)
+	<-progDone
+
 	for err := range errCh {
 		if err != nil {
 			os.Remove(outputPath)
@@ -560,6 +601,13 @@ func (s *Service) downloadViaCDN(ctx context.Context, result SearchResult, filen
 			return fmt.Errorf("concurrent download: %w", err)
 		}
 	}
+
+	onProgress(domain.DownloadProgress{
+		Status:          domain.DownloadDownloading,
+		Progress:        45,
+		DownloadedBytes: fileSize,
+		TotalBytes:      fileSize,
+	})
 
 	logs.Debug("Downloaded %d bytes to %s (%d workers)", fileSize, outputPath, s.maxDownloadThreads)
 	return nil

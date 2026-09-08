@@ -20,9 +20,10 @@ func (h *Handler) handlePlaylistsRefresh(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	user := h.currentUser()
 	result := make([]map[string]interface{}, len(playlists))
 	for i, p := range playlists {
-		if p.OwnerID != h.user.ID {
+		if user == nil || p.OwnerID != user.ID {
 			p.TrackCount = 0
 		}
 		result[i] = map[string]interface{}{
@@ -80,11 +81,12 @@ func (h *Handler) handlePlaylists(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	user := h.currentUser()
 	result := make([]map[string]interface{}, len(playlists))
 
 	for i, p := range playlists {
 
-		if p.OwnerID != h.user.ID {
+		if user == nil || p.OwnerID != user.ID {
 			p.TrackCount = 0
 		}
 
